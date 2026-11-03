@@ -1,188 +1,194 @@
-import type { VerifyResult, VerifySignal } from "./types";
+import type { VerifyResult, VerifySignal, VerifyVerdict } from "./types";
 
-interface Sample {
-  pixels: Uint8ClampedArray;
-  centreGreen: number;
-}
-
-const WIDTH = 160;
-const HEIGHT = 120;
+const ANALYSIS_WIDTH = 160;
+const ANALYSIS_HEIGHT = 120;
+const BUFFER_SIZE = 30;
 const SAMPLE_INTERVAL_MS = 500;
-const BUFFER_LENGTH = 30;
-const NOISE_THRESHOLD = 1.2;
-const FRINGING_THRESHOLD = 0.65;
-const BREATHING_RMS_THRESHOLD = 0.35;
-const SAMPLE_RATE_HZ = 1000 / SAMPLE_INTERVAL_MS;
 
-function meanGreenInCentre(pixels: Uint8ClampedArray): number {
-  const x0 = Math.floor(WIDTH * 0.35);
-  const x1 = Math.ceil(WIDTH * 0.65);
-  const y0 = Math.floor(HEIGHT * 0.25);
-  const y1 = Math.ceil(HEIGHT * 0.78);
-  let sum = 0;
-  let count = 0;
-  for (let y = y0; y < y1; y += 1) {
-    for (let x = x0; x < x1; x += 1) {
-      sum += pixels[(y * WIDTH + x) * 4 + 1] ?? 0;
-      count += 1;
-    }
-  }
-  return count ? sum / count : 0;
-}
-
-function noiseFloor(samples: Sample[]): number {
-  if (samples.length < 2) return 0;
-  const topHeight = Math.max(1, Math.floor(HEIGHT * 0.15));
-  let total = 0;
-  let comparisons = 0;
-  for (let frame = 1; frame < samples.length; frame += 1) {
-    const previous = samples[frame - 1]?.pixels;
-    const current = samples[frame]?.pixels;
-    if (!previous || !current) continue;
-    for (let y = 0; y < topHeight; y += 1) {
-      for (let x = 0; x < WIDTH; x += 1) {
-        const index = (y * WIDTH + x) * 4;
-        total += Math.abs((current[index] ?? 0) - (previous[index] ?? 0));
-        total += Math.abs((current[index + 1] ?? 0) - (previous[index + 1] ?? 0));
-        total += Math.abs((current[index + 2] ?? 0) - (previous[index + 2] ?? 0));
-        comparisons += 3;
-      }
-    }
-  }
-  return comparisons ? total / comparisons : 0;
-}
-
-function edgeFringing(pixels: Uint8ClampedArray): number {
-  const x0 = Math.max(1, Math.floor(WIDTH * 0.35));
-  const x1 = Math.min(WIDTH - 1, Math.ceil(WIDTH * 0.65));
-  let midEdges = 0;
-  let strongEdges = 0;
-  for (let y = 1; y < HEIGHT - 1; y += 1) {
-    for (let x = x0; x < x1; x += 1) {
-      const left = ((y * WIDTH + x - 1) * 4);
-      const right = ((y * WIDTH + x + 1) * 4);
-      const above = (((y - 1) * WIDTH + x) * 4);
-      const below = (((y + 1) * WIDTH + x) * 4);
-      const luminance = (index: number): number =>
-        (pixels[index] ?? 0) * 0.299 + (pixels[index + 1] ?? 0) * 0.587 + (pixels[index + 2] ?? 0) * 0.114;
-      const dx = (luminance(right) - luminance(left)) / 2;
-      const dy = (luminance(below) - luminance(above)) / 2;
-      const magnitude = Math.sqrt(dx * dx + dy * dy);
-      if (magnitude >= 8 && magnitude < 40) midEdges += 1;
-      else if (magnitude >= 40) strongEdges += 1;
-    }
-  }
-  const edgeCount = midEdges + strongEdges;
-  return edgeCount ? midEdges / edgeCount : 0;
-}
-
-function breathingBand(samples: Sample[]): number {
-  const values = samples.map((sample) => sample.centreGreen);
-  const n = values.length;
-  if (n < 6) return 0;
-  const mean = values.reduce((sum, value) => sum + value, 0) / n;
-  let power = 0;
-  let bins = 0;
-  for (let k = 1; k <= Math.floor(n / 2); k += 1) {
-    const frequency = (k * SAMPLE_RATE_HZ) / n;
-    if (frequency < 0.1 || frequency > 0.5) continue;
-    let real = 0;
-    let imaginary = 0;
-    for (let index = 0; index < n; index += 1) {
-      const value = (values[index] ?? 0) - mean;
-      const angle = (2 * Math.PI * k * index) / n;
-      real += value * Math.cos(angle);
-      imaginary -= value * Math.sin(angle);
-    }
-    power += (real * real + imaginary * imaginary) / (n * n);
-    bins += 1;
-  }
-  return bins ? Math.sqrt((2 * power) / bins) : 0;
-}
-
-function clamp01(value: number): number {
-  return Math.max(0, Math.min(1, value));
-}
-
-function makeResult(samples: Sample[]): VerifyResult {
-  const current = samples[samples.length - 1]?.pixels ?? new Uint8ClampedArray(WIDTH * HEIGHT * 4);
-  const noise = noiseFloor(samples);
-  const fringing = edgeFringing(current);
-  const breathing = breathingBand(samples);
-  const passed = [
-    noise > NOISE_THRESHOLD,
-    fringing < FRINGING_THRESHOLD,
-    breathing > BREATHING_RMS_THRESHOLD,
-  ];
-  const allPass = passed.every(Boolean);
-  const allFail = passed.every((value) => !value);
-  const verdict = allPass ? "PRESENT" : allFail ? "ABSENT" : "INCONCLUSIVE";
-  const margins = [
-    (noise - NOISE_THRESHOLD) / Math.max(noise + NOISE_THRESHOLD, 1),
-    (FRINGING_THRESHOLD - fringing) / Math.max(FRINGING_THRESHOLD, 0.01),
-    (breathing - BREATHING_RMS_THRESHOLD) / Math.max(breathing + BREATHING_RMS_THRESHOLD, 0.01),
-  ];
-  const consensus = margins.reduce((sum, value) => sum + value, 0) / margins.length;
-  const confidence = allPass || allFail
-    ? clamp01(0.5 + Math.abs(consensus) * 0.5)
-    : clamp01(0.5 + Math.abs(consensus) * 0.25);
-  const signals: VerifySignal[] = [
-    { name: "noise_floor", value: noise, unit: "mean absolute RGB delta", passed: passed[0] ?? false },
-    { name: "edge_fringing", value: fringing, unit: "mid-edge proportion", passed: passed[1] ?? false },
-    { name: "breathing_band", value: breathing, unit: "green-channel RMS", passed: passed[2] ?? false },
-  ];
-  return { verdict, confidence, signals };
-}
-
-export function createVerifier(
-  video: HTMLVideoElement,
-  canvas: HTMLCanvasElement,
-): {
+export interface Verifier {
   start(): void;
   stop(): void;
   latest(): VerifyResult | null;
-  onResult(cb: (r: VerifyResult) => void): void;
-} {
-  canvas.width = WIDTH;
-  canvas.height = HEIGHT;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  const samples: Sample[] = [];
-  const callbacks: Array<(result: VerifyResult) => void> = [];
-  let result: VerifyResult | null = null;
-  let running = false;
-  let frameId = 0;
-  let lastSample = 0;
+  onResult(cb: (result: VerifyResult) => void): void;
+}
 
-  const tick = (timestamp: number): void => {
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+
+export function createVerifier(video: HTMLVideoElement, canvas: HTMLCanvasElement): Verifier {
+  canvas.width = ANALYSIS_WIDTH;
+  canvas.height = ANALYSIS_HEIGHT;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  const frames: Uint8ClampedArray[] = [];
+  const greenMeans: number[] = [];
+  let rafId = 0;
+  let running = false;
+  let lastSample = 0;
+  let current: VerifyResult | null = null;
+  const listeners: Array<(result: VerifyResult) => void> = [];
+
+  function sample(): void {
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+    const data = ctx.getImageData(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT).data;
+    frames.push(data);
+    if (frames.length > BUFFER_SIZE) frames.shift();
+
+    let greenSum = 0;
+    let count = 0;
+    const startY = Math.floor(ANALYSIS_HEIGHT * 0.25);
+    const endY = Math.floor(ANALYSIS_HEIGHT * 0.75);
+    const startX = Math.floor(ANALYSIS_WIDTH * 0.3);
+    const endX = Math.floor(ANALYSIS_WIDTH * 0.7);
+    for (let y = startY; y < endY; y += 1) {
+      for (let x = startX; x < endX; x += 1) {
+        const offset = (y * ANALYSIS_WIDTH + x) * 4;
+        greenSum += data[offset + 1];
+        count += 1;
+      }
+    }
+    greenMeans.push(count > 0 ? greenSum / count : 0);
+    if (greenMeans.length > BUFFER_SIZE) greenMeans.shift();
+  }
+
+  function noiseFloor(): number {
+    if (frames.length < 2) return Number.NaN;
+    let total = 0;
+    let pixels = 0;
+    const bandHeight = Math.max(1, Math.floor(ANALYSIS_HEIGHT * 0.15));
+    for (let i = 1; i < frames.length; i += 1) {
+      const a = frames[i - 1];
+      const b = frames[i];
+      for (let y = 0; y < bandHeight; y += 1) {
+        for (let x = 0; x < ANALYSIS_WIDTH; x += 1) {
+          const offset = (y * ANALYSIS_WIDTH + x) * 4;
+          total += Math.abs(a[offset] - b[offset]);
+          total += Math.abs(a[offset + 1] - b[offset + 1]);
+          total += Math.abs(a[offset + 2] - b[offset + 2]);
+          pixels += 3;
+        }
+      }
+    }
+    return pixels > 0 ? total / pixels : Number.NaN;
+  }
+
+  function edgeFringing(): number {
+    if (frames.length === 0) return Number.NaN;
+    const data = frames[frames.length - 1];
+    const midX = Math.floor(ANALYSIS_WIDTH / 2);
+    const spanX = Math.floor(ANALYSIS_WIDTH * 0.2);
+    let midStrength = 0;
+    let strongStrength = 0;
+    let samples = 0;
+    for (let x = midX - spanX; x < midX + spanX; x += 1) {
+      for (let y = 1; y < ANALYSIS_HEIGHT - 1; y += 1) {
+        const offset = (y * ANALYSIS_WIDTH + x) * 4;
+        const above = ((y - 1) * ANALYSIS_WIDTH + x) * 4;
+        const below = ((y + 1) * ANALYSIS_WIDTH + x) * 4;
+        const gradient =
+          Math.abs(data[offset] - data[above]) +
+          Math.abs(data[offset] - data[below]);
+        if (gradient > 12 && gradient <= 45) midStrength += 1;
+        if (gradient > 45) strongStrength += 1;
+        samples += 1;
+      }
+    }
+    if (samples === 0) return Number.NaN;
+    const midRatio = midStrength / samples;
+    const strongRatio = strongStrength / samples;
+    return strongRatio > 0 ? midRatio / (midRatio + strongRatio) : 0;
+  }
+
+  function breathingBand(): number {
+    if (greenMeans.length < 8) return Number.NaN;
+    const values = greenMeans.slice();
+    const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+    if (!Number.isFinite(mean)) return Number.NaN;
+    let energy = 0;
+    let energyOut = 0;
+    const sampleRate = 1000 / SAMPLE_INTERVAL_MS;
+    for (let i = 1; i < values.length - 1; i += 1) {
+      const band = values[i] - (values[i - 1] + values[i + 1]) / 2;
+      energy += band * band;
+      const drift = values[i] - mean;
+      energyOut += drift * drift;
+    }
+    if (energyOut <= 0) return Number.NaN;
+    const ratio = energy / energyOut;
+    return Number.isFinite(ratio) ? ratio * sampleRate : Number.NaN;
+  }
+
+  function analyse(): void {
+    const noise = noiseFloor();
+    const fringing = edgeFringing();
+    const breathing = breathingBand();
+
+    const signals: VerifySignal[] = [
+      { name: "noise_floor", value: noise, unit: "mean abs diff", passed: Number.isFinite(noise) ? noise > 0.6 : false },
+      { name: "edge_fringing", value: fringing, unit: "mid/strong ratio", passed: Number.isFinite(fringing) ? fringing < 0.85 : false },
+      { name: "breathing_band", value: breathing, unit: "band energy", passed: Number.isFinite(breathing) ? breathing > 0.02 : false },
+    ];
+
+    const finite = signals.every((s) => Number.isFinite(s.value));
+    if (!finite) {
+      current = { verdict: "INCONCLUSIVE", confidence: 0, signals };
+      emit();
+      return;
+    }
+
+    const passed = signals.filter((s) => s.passed).length;
+    let verdict: VerifyVerdict;
+    if (passed === 3) verdict = "PRESENT";
+    else if (passed === 0) verdict = "ABSENT";
+    else verdict = "INCONCLUSIVE";
+
+    const confidence = clamp01(Math.abs(passed - 1.5) / 1.5);
+    current = { verdict, confidence, signals };
+    emit();
+  }
+
+  function emit(): void {
+    if (!current) return;
+    for (const listener of listeners) {
+      try {
+        listener(current);
+      } catch (error) {
+        console.error("Verifier listener threw", error);
+      }
+    }
+  }
+
+  function loop(): void {
     if (!running) return;
-    frameId = requestAnimationFrame(tick);
-    if (!context || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || timestamp - lastSample < SAMPLE_INTERVAL_MS) return;
-    lastSample = timestamp;
-    context.drawImage(video, 0, 0, WIDTH, HEIGHT);
-    const pixels = context.getImageData(0, 0, WIDTH, HEIGHT).data;
-    samples.push({ pixels: new Uint8ClampedArray(pixels), centreGreen: meanGreenInCentre(pixels) });
-    if (samples.length > BUFFER_LENGTH) samples.shift();
-    if (samples.length < 8) return;
-    result = makeResult(samples);
-    for (const callback of callbacks) callback(result);
-  };
+    const now = performance.now();
+    if (now - lastSample >= SAMPLE_INTERVAL_MS) {
+      lastSample = now;
+      sample();
+      if (frames.length >= 4) analyse();
+    }
+    rafId = requestAnimationFrame(loop);
+  }
 
   return {
     start(): void {
       if (running) return;
       running = true;
       lastSample = 0;
-      frameId = requestAnimationFrame(tick);
+      rafId = requestAnimationFrame(loop);
     },
     stop(): void {
       running = false;
-      cancelAnimationFrame(frameId);
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = 0;
     },
     latest(): VerifyResult | null {
-      return result;
+      return current;
     },
-    onResult(callback: (value: VerifyResult) => void): void {
-      callbacks.push(callback);
+    onResult(cb: (result: VerifyResult) => void): void {
+      listeners.push(cb);
     },
   };
 }
