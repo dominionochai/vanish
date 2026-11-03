@@ -1,0 +1,8 @@
+{
+  "name": "vanish",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "typecheck": "tsc --noEmit", "build": "vite build", "spec:check": "node scripts/check-spec-drift.mjs" },
+  "devDependencies": { "typescript": "5.7.3", "vite": "6.1.0" }
+}
