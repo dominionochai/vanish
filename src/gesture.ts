@@ -1,113 +1,117 @@
-const VISION_MODULE_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
-const VISION_WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
-interface NormalizedLandmark {
-  x: number;
-  y: number;
-}
+const MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-interface HandLandmarkerResult {
-  landmarks: NormalizedLandmark[][];
-}
+const FOREHEAD = { xMin: 0.35, xMax: 0.65, yMin: 0.05, yMax: 0.3 };
+const FRAMES_TO_FIRE = 4;
+const COOLDOWN_MS = 1500;
 
-interface HandLandmarker {
-  detectForVideo(video: HTMLVideoElement, timestamp: number): HandLandmarkerResult;
-  close(): void;
-}
-
-interface VisionTasksModule {
-  FilesetResolver: {
-    forVisionTasks(path: string): Promise<unknown>;
-  };
-  HandLandmarker: {
-    createFromOptions(fileset: unknown, options: {
-      baseOptions: { modelAssetPath: string };
-      runningMode: "VIDEO";
-      numHands: number;
-    }): Promise<HandLandmarker>;
-  };
-}
-
-function isInsideForehead(point: NormalizedLandmark): boolean {
-  return point.x >= 0.35 && point.x <= 0.65 && point.y >= 0.05 && point.y <= 0.30;
-}
-
-export async function createTapTrigger(opts: {
+export interface GestureTriggerOptions {
   video: HTMLVideoElement;
   onFire: () => void;
-  onProgress?: (n: number) => void;
-}): Promise<{ start(): void; stop(): void }> {
+  onProgress?: (consecutiveFrames: number) => void;
+}
+
+export interface GestureTrigger {
+  start(): Promise<void>;
+  stop(): void;
+}
+
+function insideForehead(x: number, y: number): boolean {
+  return x >= FOREHEAD.xMin && x <= FOREHEAD.xMax && y >= FOREHEAD.yMin && y <= FOREHEAD.yMax;
+}
+
+export async function createTapTrigger(options: GestureTriggerOptions): Promise<GestureTrigger> {
   let landmarker: HandLandmarker | null = null;
-  try {
-    const module = await import(/* @vite-ignore */ VISION_MODULE_URL) as VisionTasksModule;
-    const fileset = await module.FilesetResolver.forVisionTasks(VISION_WASM_URL);
-    landmarker = await module.HandLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: HAND_MODEL_URL },
-      runningMode: "VIDEO",
-      numHands: 1,
-    });
-  } catch (error) {
-    console.error("Unable to load the hand landmarker:", error);
+  let running = false;
+  let rafId = 0;
+  let consecutive = 0;
+  let cooldownUntil = 0;
+  let lastTimestamp = -1;
+
+  async function ensureLandmarker(): Promise<HandLandmarker | null> {
+    if (landmarker) return landmarker;
+    try {
+      const fileset = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm",
+      );
+      landmarker = await HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_URL },
+        runningMode: "VIDEO",
+        numHands: 1,
+      });
+      return landmarker;
+    } catch (error) {
+      console.error("HandLandmarker failed to load", error);
+      return null;
+    }
   }
 
-  let running = false;
-  let frameId = 0;
-  let count = 0;
-  let cooldownUntil = 0;
-  let previousTimestamp = -1;
-
-  const frame = (): void => {
-    if (!running) return;
-    frameId = requestAnimationFrame(frame);
-    if (!landmarker || opts.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-    const now = performance.now();
-    if (now < cooldownUntil) return;
-    const timestamp = Math.max(now, previousTimestamp + 1);
-    previousTimestamp = timestamp;
+  function report(count: number): void {
+    if (!options.onProgress) return;
     try {
-      const result = landmarker.detectForVideo(opts.video, timestamp);
-      const hand = result.landmarks[0];
-      if (hand && hand.length > 17) {
-        const fingertip = hand[8];
-        const palmPoints = [hand[0], hand[5], hand[9], hand[13], hand[17]];
-        if (fingertip && palmPoints.every((point): point is NormalizedLandmark => Boolean(point))) {
-          const palmCentre: NormalizedLandmark = {
-            x: palmPoints.reduce((sum, point) => sum + point.x, 0) / palmPoints.length,
-            y: palmPoints.reduce((sum, point) => sum + point.y, 0) / palmPoints.length,
-          };
-          count = isInsideForehead(fingertip) && isInsideForehead(palmCentre) ? count + 1 : 0;
-        } else {
-          count = 0;
+      options.onProgress(count);
+    } catch (error) {
+      console.error("onProgress handler threw", error);
+    }
+  }
+
+  function tick(timestamp: number): void {
+    if (!running || !landmarker) return;
+    rafId = requestAnimationFrame(tick);
+    if (timestamp < cooldownUntil) return;
+    if (timestamp <= lastTimestamp) return;
+    lastTimestamp = timestamp;
+
+    let handInRegion = false;
+    try {
+      const result = landmarker.detectForVideo(options.video, timestamp);
+      const hand = result.landmarks?.[0];
+      if (hand && hand.length >= 21) {
+        const tip = hand[8];
+        const palmIds = [0, 5, 9, 13, 17];
+        let px = 0;
+        let py = 0;
+        for (const id of palmIds) {
+          px += hand[id].x;
+          py += hand[id].y;
         }
-      } else {
-        count = 0;
-      }
-      opts.onProgress?.(count);
-      if (count >= 4) {
-        opts.onFire();
-        count = 0;
-        opts.onProgress?.(count);
-        cooldownUntil = performance.now() + 1500;
+        px /= palmIds.length;
+        py /= palmIds.length;
+        handInRegion = insideForehead(tip.x, tip.y) || insideForehead(px, py);
       }
     } catch (error) {
-      console.error("Hand landmark detection failed:", error);
-      count = 0;
-      opts.onProgress?.(count);
+      console.error("Hand detection failed", error);
+      return;
     }
-  };
+
+    consecutive = handInRegion ? consecutive + 1 : 0;
+    report(consecutive);
+    if (consecutive >= FRAMES_TO_FIRE) {
+      consecutive = 0;
+      cooldownUntil = timestamp + COOLDOWN_MS;
+      report(0);
+      try {
+        options.onFire();
+      } catch (error) {
+        console.error("onFire handler threw", error);
+      }
+    }
+  }
 
   return {
-    start(): void {
-      if (!landmarker || running) return;
+    async start(): Promise<void> {
+      if (running) return;
+      const instance = await ensureLandmarker();
+      if (!instance) return;
       running = true;
-      frameId = requestAnimationFrame(frame);
+      rafId = requestAnimationFrame(tick);
     },
     stop(): void {
       running = false;
-      cancelAnimationFrame(frameId);
-      landmarker?.close();
-      landmarker = null;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = 0;
     },
   };
 }
