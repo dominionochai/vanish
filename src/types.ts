@@ -1,3 +1,5 @@
+export type AppMode = "vanish" | "verify";
+
 export type PresenceState = "detected" | "lost";
 
 export interface PipelineHandle {
