@@ -1,48 +1,24 @@
 /// <reference types="vite/client" />
-
 import "./styles.css";
-import { bindModeTabs } from "./ui";
-import { bindCameraControls } from "./camera";
-import { bindPlateCapture, getCapturedPlate } from "./plate";
 import { initializeLivePipeline } from "./pipeline";
-
-bindModeTabs();
-bindCameraControls();
-bindPlateCapture();
-
-const video = document.getElementById("source-video");
-const outputCanvas = document.getElementById("stage");
-const stateElement = document.getElementById("frame-state");
-
-if (
-  !(video instanceof HTMLVideoElement) ||
-  !(outputCanvas instanceof HTMLCanvasElement) ||
-  !(stateElement instanceof HTMLElement)
-) {
-  throw new Error("The live pipeline elements are missing from the page.");
-}
-
-async function startLivePipelineWhenReady(): Promise<void> {
-  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    await new Promise<void>((resolve) => {
-      video.addEventListener("playing", () => resolve(), { once: true });
-    });
-  }
-
-  while (!getCapturedPlate()) {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-  }
-
-  outputCanvas.hidden = false;
-  video.style.display = "none";
-
-  const pipeline = await initializeLivePipeline(
-    video,
-    outputCanvas,
-    getCapturedPlate,
-    stateElement,
-  );
-  pipeline.start();
-}
-
-void startLivePipelineWhenReady();
+import { createTapTrigger } from "./gesture";
+import { createVerifier } from "./verify";
+const el=(id:string)=>document.getElementById(id)!;
+const video=el("source-video") as HTMLVideoElement, stage=el("stage") as HTMLCanvasElement;
+const frameState=el("frame-state"), gestureState=el("gesture-state"), stageEmpty=el("stage-empty"), sourceLabel=el("source-label"), resolution=el("resolution-label"), presenceLine=el("presence-line");
+const startButton=el("start-camera") as HTMLButtonElement, stopButton=el("stop-camera") as HTMLButtonElement, captureButton=el("capture-plate") as HTMLButtonElement, toggleButton=el("toggle-vanish") as HTMLButtonElement, clearButton=el("clear-plate") as HTMLButtonElement;
+const plateState=el("plate-state"), thumb=el("plate-thumb") as HTMLImageElement, placeholder=el("plate-placeholder"), status=el("camera-status"), system=el("system-state"), verifyStatus=el("verify-status");
+let stream:MediaStream|null=null, plate:HTMLCanvasElement|null=null, pipeline:Awaited<ReturnType<typeof initializeLivePipeline>>|null=null, gesture:Awaited<ReturnType<typeof createTapTrigger>>|null=null, verifier:ReturnType<typeof createVerifier>|null=null;
+let mode:"vanish"|"verify"="vanish", presented=true, generation=0, capturing=false;
+function setPresence(value:boolean){if(!pipeline||!plate){frameState.textContent="CAPTURE A CLEAN ROOM PLATE FIRST";return;}presented=value;pipeline.setPresented(value);toggleButton.textContent=value?"Activate removal":"Restore presence";frameState.textContent=value?"PRESENCE RETAINED":"REMOVAL ACTIVE / LOCAL PREVIEW";}
+function updateVerify(r:ReturnType<NonNullable<typeof verifier>["latest"]>){if(!r)return;el("verdict").textContent=r.verdict;el("evidence-agreement").textContent=`AGREEMENT: ${r.signals.filter(s=>s.passed).length} / 3`;el("verdict-confidence").textContent=`CONFIDENCE: ${(r.confidence*100).toFixed(0)}%`;el("verdict-note").textContent="Heuristic signals only; this is not identity, liveness, or provenance verification.";const ids:Record<string,[string,string]>={noise_floor:["noise-value","noise-state"],edge_fringing:["edge-value","edge-state"],breathing_band:["pulse-value","pulse-state"]};for(const s of r.signals){const pair=ids[s.name];if(pair){el(pair[0]).textContent=s.value.toFixed(3);el(pair[1]).textContent=s.passed?"SIGNAL PASSED":"WEAK / NOT CONFIRMED";}}}
+function selectMode(next:"vanish"|"verify"){mode=next;for(const [name,id] of [["vanish","mode-vanish"],["verify","mode-verify"]] as const){const b=el(id);b.classList.toggle("selected",name===next);b.setAttribute("aria-pressed",String(name===next));}el("vanish-panel").hidden=next!=="vanish";el("verify-panel").hidden=next!=="verify";if(next==="verify"){if(stream){if(!verifier){verifier=createVerifier(video,document.createElement("canvas"));verifier.onResult(updateVerify);}verifier.start();verifyStatus.textContent="Forensic signals computed locally from live camera frames.";}else verifyStatus.textContent="Connect the live camera to collect local measurements.";}else verifier?.stop();}
+el("mode-vanish").addEventListener("click",()=>selectMode("vanish"));el("mode-verify").addEventListener("click",()=>selectMode("verify"));
+async function connect(){if(stream)return;startButton.disabled=true;status.textContent="Requesting camera access…";try{if(!navigator.mediaDevices?.getUserMedia)throw Error("Camera access requires HTTPS or localhost in a supported browser.");const s=await navigator.mediaDevices.getUserMedia({audio:false,video:true});stream=s;const run=++generation;video.srcObject=s;video.muted=true;await video.play();sourceLabel.textContent="SOURCE: CAMERA";resolution.textContent=`INPUT: ${video.videoWidth} × ${video.videoHeight}`;video.addEventListener("loadedmetadata",()=>resolution.textContent=`INPUT: ${video.videoWidth} × ${video.videoHeight}`,{once:true});stageEmpty.hidden=true;stopButton.disabled=false;captureButton.disabled=false;system.textContent="LOCAL / LIVE";status.textContent="Live camera connected. Video stays in this browser.";frameState.textContent="LIVE / INITIALIZING PIPELINE";pipeline=await initializeLivePipeline(video,stage,()=>plate,presenceLine);if(run!==generation){pipeline.stop();return;}pipeline.start();video.hidden=true;if(!frameState.textContent.startsWith("ERROR"))frameState.textContent="LIVE / WAITING FOR PLATE";gesture=await createTapTrigger({video,onProgress:n=>gestureState.textContent=`TAP ${n}/4`,onFire:()=>{if(mode==="vanish")setPresence(false);}});if(run===generation)gesture.start();else gesture.stop();if(mode==="verify")selectMode("verify");}catch(e){const msg=e instanceof Error?e.message:"Could not connect camera.";status.textContent=msg;frameState.textContent="CAMERA ERROR / CHECK PERMISSION";system.textContent="LOCAL / ERROR";if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}video.srcObject=null;startButton.disabled=false;stopButton.disabled=true;captureButton.disabled=true;}}
+startButton.addEventListener("click",()=>void connect());
+stopButton.addEventListener("click",()=>{generation++;gesture?.stop();gesture=null;verifier?.stop();verifier=null;pipeline?.stop();pipeline=null;stream?.getTracks().forEach(t=>t.stop());stream=null;video.pause();video.srcObject=null;video.hidden=false;plate=null;thumb.removeAttribute("src");thumb.hidden=true;placeholder.hidden=false;plateState.textContent="Required. Captured in memory only; never saved.";clearButton.disabled=true;captureButton.disabled=true;toggleButton.disabled=true;toggleButton.textContent="Activate removal";presented=true;stageEmpty.hidden=false;sourceLabel.textContent="SOURCE: NONE";resolution.textContent="INPUT: —";presenceLine.textContent="PRESENCE: LOST";frameState.textContent="LOST / WAITING FOR INPUT";gestureState.textContent="TAP 0/4";status.textContent="Camera disconnected. No video leaves this browser.";system.textContent="LOCAL / IDLE";startButton.disabled=false;});
+captureButton.addEventListener("click",async()=>{if(!stream||capturing)return;if(!video.videoWidth||!video.videoHeight){plateState.textContent="Waiting for a live camera frame; try again.";return;}capturing=true;captureButton.disabled=true;try{for(let n=3;n>0;n--){if(!stream?.active)throw Error("Camera disconnected during capture.");plateState.textContent=`Capturing clean room in ${n}…`;captureButton.textContent=`Capturing / ${n} s`;await new Promise(r=>setTimeout(r,1000));}const c=document.createElement("canvas");c.width=video.videoWidth;c.height=video.videoHeight;const ctx=c.getContext("2d");if(!ctx)throw Error("Could not create capture canvas.");ctx.drawImage(video,0,0,c.width,c.height);plate=c;thumb.src=c.toDataURL("image/png");thumb.hidden=false;placeholder.hidden=true;plateState.textContent=`Room plate captured (${c.width} × ${c.height}) in memory only; never saved.`;clearButton.disabled=false;toggleButton.disabled=!pipeline;setPresence(true);}catch(e){plateState.textContent=e instanceof Error?e.message:"Capture failed.";}finally{capturing=false;captureButton.textContent="Capture clean room / 3 s";captureButton.disabled=!stream;}});
+clearButton.addEventListener("click",()=>{plate=null;thumb.removeAttribute("src");thumb.hidden=true;placeholder.hidden=false;plateState.textContent="Required. Captured in memory only; never saved.";clearButton.disabled=true;toggleButton.disabled=true;if(pipeline)pipeline.setPresented(true);presented=true;frameState.textContent="LIVE / WAITING FOR PLATE";});
+toggleButton.addEventListener("click",()=>setPresence(!presented));
+window.addEventListener("keydown",e=>{if(e.code==="Space"&&!e.repeat&&mode==="vanish"&&!(e.target instanceof HTMLButtonElement)){e.preventDefault();setPresence(!presented);}});
+selectMode("vanish");
