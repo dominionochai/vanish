@@ -1,3 +1,10 @@
+/** The most recently captured clean-room plate, retained offscreen in memory. */
+let capturedPlate: HTMLCanvasElement | null = null;
+
+export function getCapturedPlate(): HTMLCanvasElement | null {
+  return capturedPlate;
+}
+
 /** Bind the in-memory clean-room plate capture control. */
 export function bindPlateCapture(): void {
   const captureButton = document.getElementById("capture-plate");
@@ -77,6 +84,7 @@ export function bindPlateCapture(): void {
       thumbnail.hidden = false;
       if (placeholder instanceof HTMLElement) placeholder.hidden = true;
       state.textContent = `Room plate captured (${canvas.width} × ${canvas.height}) in memory only; never saved.`;
+      capturedPlate = canvas;
     } catch {
       state.textContent = "Could not capture a frame. Check that the camera is active and try again.";
     } finally {
